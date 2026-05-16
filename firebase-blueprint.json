@@ -1,0 +1,107 @@
+{
+  "entities": {
+    "organisation": {
+      "title": "Organisation",
+      "description": "Root entity for the entire org structure",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "ownerId", "createdAt"]
+    },
+    "department": {
+      "title": "Department",
+      "description": "Infinite nestable unit of work",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "orgId": { "type": "string" },
+        "parentId": { "type": "string" },
+        "leadId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "orgId", "createdAt"]
+    },
+    "role": {
+      "title": "Role",
+      "description": "A specific position within a department",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "deptId": { "type": "string" },
+        "orgId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "deptId", "orgId", "createdAt"]
+    },
+    "user": {
+      "title": "User",
+      "description": "App user with multiple potential roles",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "orgId": { "type": "string" },
+        "roleIds": { "type": "array", "items": { "type": "string" } },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "email", "createdAt"]
+    },
+    "task": {
+      "title": "Task",
+      "description": "Work item assigned to a user",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "assignedBy": { "type": "string" },
+        "assignedTo": { "type": "string" },
+        "deptId": { "type": "string" },
+        "orgId": { "type": "string" },
+        "deadline": { "type": "string", "format": "date-time" },
+        "state": { "type": "string", "enum": ["pending", "help_needed", "done", "expired", "rejected"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "assignedBy", "assignedTo", "deptId", "orgId", "state", "createdAt"]
+    },
+    "invite": {
+      "title": "Invite Token",
+      "description": "One-time link token for role signup",
+      "type": "object",
+      "properties": {
+        "roleId": { "type": "string" },
+        "orgId": { "type": "string" },
+        "token": { "type": "string" },
+        "used": { "type": "boolean" },
+        "usedBy": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["roleId", "orgId", "token", "used", "createdAt"]
+    },
+    "notification": {
+      "title": "Notification",
+      "description": "In-app notification for events",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "text": { "type": "string" },
+        "type": { "type": "string" },
+        "metadata": { "type": "object" },
+        "read": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "text", "read", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/organisations/{orgId}": { "schema": "organisation", "description": "Org roots" },
+    "/departments/{deptId}": { "schema": "department", "description": "Recursive departments" },
+    "/roles/{roleId}": { "schema": "role", "description": "Roles within depts" },
+    "/users/{userId}": { "schema": "user", "description": "User profiles" },
+    "/tasks/{taskId}": { "schema": "task", "description": "Task items" },
+    "/invites/{inviteId}": { "schema": "invite", "description": "Signup tokens" },
+    "/notifications/{notifId}": { "schema": "notification", "description": "User notifications" }
+  }
+}

@@ -1,0 +1,2476 @@
+# Project Codebase Context
+
+
+
+## File: package.json
+```
+{
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "start": "node dist/server.cjs",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^1.52.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@vitejs/plugin-react": "^5.0.4",
+    "bcryptjs": "^3.0.3",
+    "clsx": "^2.1.1",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "firebase": "^12.13.0",
+    "firebase-admin": "^13.10.0",
+    "jsonwebtoken": "^9.0.3",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "react-router-dom": "^7.15.1",
+    "tailwind-merge": "^3.6.0",
+    "vite": "^6.2.3"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.3"
+  }
+}
+
+```
+
+
+## File: firestore.rules
+```
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function getUserOrgId() {
+      // Returns the orgId of the currently logged in user
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.orgId;
+    }
+
+    function isOrgMember(orgId) {
+      return isSignedIn() && getUserOrgId() == orgId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Organisations
+    match /organisations/{orgId} {
+      allow get: if isSignedIn();
+      allow create: if isSignedIn() && incoming().ownerId == request.auth.uid;
+      allow update: if isOwner(existing().ownerId);
+    }
+
+    // Users
+    match /users/{userId} {
+      // Users can get their own data, or anyone can get anyone in their org
+      allow get: if isOwner(userId) || isOrgMember(existing().orgId);
+      
+      // Users can only list members of their own organisation
+      allow list: if isSignedIn() && resource.data.orgId == getUserOrgId(); 
+      
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) || (isSignedIn() && exists(/databases/$(database)/documents/organisations/$(existing().orgId)) && get(/databases/$(database)/documents/organisations/$(existing().orgId)).data.ownerId == request.auth.uid);
+    }
+
+    // Departments
+    match /departments/{deptId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create, update: if isOrgMember(incoming().orgId);
+    }
+
+    // Roles
+    match /roles/{roleId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create, update: if isOrgMember(incoming().orgId);
+    }
+
+    // Tasks
+    match /tasks/{taskId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create: if isOrgMember(incoming().orgId) && incoming().assignedBy == request.auth.uid;
+      allow update: if isOrgMember(existing().orgId) && (
+        (existing().assignedTo == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['state', 'updatedAt'])) ||
+        (existing().assignedBy == request.auth.uid)
+      );
+    }
+
+    // Chat Messages (NEW)
+    match /messages/{messageId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create: if isOrgMember(incoming().orgId) && incoming().senderId == request.auth.uid;
+    }
+
+    // File Vault (NEW)
+    match /files/{fileId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create: if isOrgMember(incoming().orgId) && incoming().uploadedBy == request.auth.uid;
+    }
+
+    // Invites
+    match /invites/{inviteId} {
+      allow get: if true; // Publicly accessible to check token
+      allow create: if isSignedIn();
+      allow update: if true; // To mark as used
+    }
+
+    // Notifications
+    match /notifications/{notifId} {
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isSignedIn();
+      allow update: if isOwner(resource.data.userId) && incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+    }
+  }
+}
+
+```
+
+
+## File: storage.rules
+```
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /orgs/{orgId}/{allPaths=**} {
+      allow read: if request.auth != null; // Anyone authenticated can read files (for now)
+      allow write: if request.auth != null; // Anyone authenticated can upload
+    }
+  }
+}
+
+```
+
+
+## File: server.ts
+```
+import express from 'express';
+import path from 'path';
+import { createServer as createViteServer } from 'vite';
+import { initializeApp, cert } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
+import { getAuth } from 'firebase-admin/auth';
+import { GoogleGenAI, Type } from '@google/genai';
+import dotenv from 'dotenv';
+import cookieParser from 'cookie-parser';
+import cors from 'cors';
+
+dotenv.config();
+
+// Initialize Firebase Admin
+// Note: In this environment, service account credentials are often pre-configured 
+// or can be initialized with default credentials if running in Cloud Run.
+// However, since we have firebase-applet-config.json, we can use that to get some info.
+// For admin SDK, we usually need a service account key. 
+// If not provided, we might have to rely on ADC (Application Default Credentials).
+initializeApp();
+
+const db = getFirestore();
+const auth = getAuth();
+
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY || '',
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build',
+    }
+  }
+});
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  app.use(cors());
+  app.use(express.json());
+  app.use(cookieParser());
+
+  // API Routes
+  
+  // Management Layer Resolver (Phase 2 hybrid)
+  app.post('/api/management/resolve', async (req, res) => {
+    try {
+      const { request_type, org_context, payload } = req.body;
+      
+      const SYSTEM_PROMPT = `
+You are the management engine for a recursive organisational system.
+You receive an org schema (dept → lead → roles, infinitely nested) and a
+management request. You return a JSON decision only — no explanation,
+no preamble, no markdown.
+
+Rules:
+- A lead has authority over all roles and sub-leads in their dept and below
+- A user holding multiple roles has the union of all their permissions
+- Help requests route to the direct lead of the dept the task belongs to
+- If the requesting user holds roles in multiple depts, resolve by task dept
+- Never grant authority upward — a role cannot affect its own lead
+- Return { "error": "insufficient_context" } if the schema is incomplete
+
+Always return valid JSON. Never return anything else.
+`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: JSON.stringify({
+          request_type,
+          org_context,
+          payload
+        }),
+        config: {
+          systemInstruction: SYSTEM_PROMPT,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              decision: { type: Type.STRING },
+              target_user_id: { type: Type.STRING },
+              reason: { type: Type.STRING },
+              confidence: { type: Type.STRING },
+              error: { type: Type.STRING }
+            }
+          }
+        }
+      });
+
+      const decision = JSON.parse(response.text || '{}');
+      res.json(decision);
+    } catch (error) {
+      console.error('Management Layer Error:', error);
+      res.status(500).json({ error: 'internal_server_error' });
+    }
+  });
+
+  // Health check
+  app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok' });
+  });
+
+  // Vite integration
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();
+
+```
+
+
+## File: .env.example
+```
+VITE_FIREBASE_API_KEY=your_api_key_here
+VITE_FIREBASE_AUTH_DOMAIN=your_project_id.firebaseapp.com
+VITE_FIREBASE_PROJECT_ID=your_project_id
+VITE_FIREBASE_STORAGE_BUCKET=your_project_id.firebasestorage.app
+VITE_FIREBASE_MESSAGING_SENDER_ID=your_messaging_sender_id
+VITE_FIREBASE_APP_ID=your_app_id
+VITE_FIRESTORE_DATABASE_ID=(default)
+
+```
+
+
+## File: src/App.tsx
+```
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
+import Dashboard from './pages/Dashboard';
+import Login from './pages/Login';
+import RegisterOrg from './pages/RegisterOrg';
+import JoinLink from './pages/JoinLink';
+import Admin from './pages/Admin';
+import { motion, AnimatePresence } from 'motion/react';
+
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const { firebaseUser, loading } = useAuth();
+  if (loading) return <div className="h-screen w-screen flex items-center justify-center font-mono animate-pulse">ORGFlow</div>;
+  if (!firebaseUser) return <Navigate to="/login" />;
+  return <>{children}</>;
+}
+
+function AdminRoute({ children }: { children: React.ReactNode }) {
+  const { isLead, loading } = useAuth();
+  if (loading) return null;
+  if (!isLead) return <Navigate to="/dashboard" />;
+  return <>{children}</>;
+}
+
+function AppContent() {
+  return (
+    <AnimatePresence mode="wait">
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="/register/org" element={<RegisterOrg />} />
+        <Route path="/join/:token" element={<JoinLink />} />
+        <Route
+          path="/dashboard/*"
+          element={
+            <ProtectedRoute>
+              <Dashboard />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/admin/*"
+          element={
+            <ProtectedRoute>
+              <AdminRoute>
+                <Admin />
+              </AdminRoute>
+            </ProtectedRoute>
+          }
+        />
+        <Route path="/" element={<Navigate to="/dashboard" />} />
+      </Routes>
+    </AnimatePresence>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <Router>
+        <AppContent />
+      </Router>
+    </AuthProvider>
+  );
+}
+
+
+```
+
+
+## File: src/components/layout/BottomNav.tsx
+```
+import { LayoutDashboard, Users, MessageSquare, Files, Bell, ShieldCheck } from 'lucide-react';
+import { NavLink } from 'react-router-dom';
+import { cn } from '../../lib/utils';
+import { useAuth } from '../../contexts/AuthContext';
+
+export default function BottomNav() {
+  const { isLead } = useAuth();
+
+  const navItems = [
+    { icon: LayoutDashboard, path: '/dashboard/tasks', label: 'Tasks' },
+    ...(isLead ? [{ icon: Users, path: '/dashboard/staff', label: 'Staff' }] : []),
+    { icon: MessageSquare, path: '/dashboard/chat', label: 'Chat' },
+    { icon: Files, path: '/dashboard/files', label: 'Vault' },
+    { icon: Bell, path: '/dashboard/notifications', label: 'Alerts' },
+  ];
+
+  return (
+    <nav className="fixed bottom-0 left-0 right-0 h-16 bottom-nav-blur flex items-center justify-around px-2 z-50">
+      {navItems.map((item) => (
+        <NavLink
+          key={item.path}
+          to={item.path}
+          className={({ isActive }) =>
+            cn(
+              "flex flex-col items-center justify-center w-12 h-12 rounded-xl transition-all",
+              isActive ? "text-neutral-900 bg-neutral-100" : "text-neutral-400 hover:text-neutral-600"
+            )
+          }
+        >
+          <item.icon className="h-6 w-6" />
+        </NavLink>
+      ))}
+      
+      {isLead && (
+        <NavLink
+          to="/admin"
+          className="flex items-center justify-center w-12 h-12 rounded-xl text-lead bg-purple-50"
+        >
+          <ShieldCheck className="h-6 w-6" />
+        </NavLink>
+      )}
+    </nav>
+  );
+}
+
+```
+
+
+## File: src/components/tasks/TaskCard.tsx
+```
+import { useState } from 'react';
+import { Task, TaskState } from '../../types';
+import { motion, AnimatePresence } from 'motion/react';
+import { cn } from '../../lib/utils';
+import { Calendar, User, ChevronDown, CheckCircle2, HelpCircle, FileUp, MessageCircle } from 'lucide-react';
+import { doc, updateDoc, serverTimestamp } from 'firebase/firestore';
+import { db } from '../../lib/firebase';
+import { useAuth } from '../../contexts/AuthContext';
+
+interface TaskCardProps {
+  task: Task;
+  key?: string;
+}
+
+const STATE_COLORS: Record<TaskState, string> = {
+  [TaskState.PENDING]: 'border-pending',
+  [TaskState.HELP_NEEDED]: 'border-help',
+  [TaskState.DONE]: 'border-done',
+  [TaskState.EXPIRED]: 'border-expired',
+  [TaskState.REJECTED]: 'border-rejected',
+};
+
+const STATE_COLORS_BG: Record<TaskState, string> = {
+  [TaskState.PENDING]: 'bg-pending',
+  [TaskState.HELP_NEEDED]: 'bg-help',
+  [TaskState.DONE]: 'bg-done',
+  [TaskState.EXPIRED]: 'bg-expired',
+  [TaskState.REJECTED]: 'bg-rejected',
+};
+
+export default function TaskCard({ task }: TaskCardProps) {
+  const [expanded, setExpanded] = useState(false);
+  const { user } = useAuth();
+  const isAssignee = task.assignedTo === user?.id;
+
+  const handleStateChange = async (newState: TaskState) => {
+    try {
+      await updateDoc(doc(db, 'tasks', task.id), {
+        state: newState,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      console.error('Error updating task state:', err);
+    }
+  };
+
+  return (
+    <motion.div
+      layout
+      className={cn(
+        "bg-white rounded-2xl border border-neutral-200 overflow-hidden task-card-border mb-4 transition-all hover:bg-neutral-50 cursor-pointer",
+        STATE_COLORS[task.state]
+      )}
+      onClick={() => setExpanded(!expanded)}
+    >
+      <div className="p-5 flex items-center justify-between">
+        <div className="space-y-1">
+          <h3 className="font-semibold text-neutral-900 leading-tight">{task.title}</h3>
+          <div className="flex items-center space-x-3 text-xs text-neutral-400">
+            <span className="flex items-center">
+              <User className="h-3 w-3 mr-1" />
+              Assigner name here
+            </span>
+            <span className="flex items-center">
+              <Calendar className="h-3 w-3 mr-1" />
+              {task.deadline ? new Date(task.deadline).toLocaleDateString() : 'No deadline'}
+            </span>
+          </div>
+        </div>
+        <motion.div animate={{ rotate: expanded ? 180 : 0 }}>
+          <ChevronDown className="h-5 w-5 text-neutral-300" />
+        </motion.div>
+      </div>
+
+      <AnimatePresence>
+        {expanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="border-t border-neutral-100 overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="p-5 space-y-6">
+              <p className="text-sm text-neutral-600 leading-relaxed">
+                {task.description}
+              </p>
+
+              <div className="flex flex-wrap gap-2">
+                {isAssignee && task.state !== TaskState.DONE && (
+                  <>
+                    <button
+                      onClick={() => handleStateChange(TaskState.DONE)}
+                      className="flex items-center px-4 py-2 bg-done text-white rounded-xl text-xs font-semibold hover:opacity-90 transition-opacity"
+                    >
+                      <CheckCircle2 className="h-4 w-4 mr-2" />
+                      Mark Done
+                    </button>
+                    <button
+                      onClick={() => handleStateChange(TaskState.HELP_NEEDED)}
+                      className="flex items-center px-4 py-2 bg-help text-white rounded-xl text-xs font-semibold hover:opacity-90 transition-opacity"
+                    >
+                      <HelpCircle className="h-4 w-4 mr-2" />
+                      Need Help
+                    </button>
+                  </>
+                )}
+                
+                <button className="flex items-center px-4 py-2 bg-neutral-100 text-neutral-600 rounded-xl text-xs font-semibold hover:bg-neutral-200 transition-all">
+                  <FileUp className="h-4 w-4 mr-2" />
+                  Attach File
+                </button>
+                
+                <button className="flex items-center px-4 py-2 border border-neutral-200 text-neutral-600 rounded-xl text-xs font-semibold hover:bg-neutral-50 transition-all">
+                  <MessageCircle className="h-4 w-4 mr-2" />
+                  Comment
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
+  );
+}
+
+```
+
+
+## File: src/contexts/AuthContext.tsx
+```
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import { doc, getDoc, onSnapshot } from 'firebase/firestore';
+import { auth, db } from '../lib/firebase';
+import { User, Organisation } from '../types';
+
+interface AuthContextType {
+  user: User | null;
+  organisation: Organisation | null;
+  firebaseUser: FirebaseUser | null;
+  loading: boolean;
+  isLead: boolean;
+}
+
+const AuthContext = createContext<AuthContextType>({
+  user: null,
+  organisation: null,
+  firebaseUser: null,
+  loading: true,
+  isLead: false,
+});
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+  const [organisation, setOrganisation] = useState<Organisation | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [isLead, setIsLead] = useState(false);
+
+  useEffect(() => {
+    let leadStatusUnsubscribe: (() => void) | null = null;
+
+    const unsubscribe = onAuthStateChanged(auth, async (fUser) => {
+      setFirebaseUser(fUser);
+      
+      // Clean up previous listener if it exists
+      if (leadStatusUnsubscribe) {
+        leadStatusUnsubscribe();
+        leadStatusUnsubscribe = null;
+      }
+
+      if (fUser) {
+        // Fetch custom user doc
+        const userDoc = await getDoc(doc(db, 'users', fUser.uid));
+        if (userDoc.exists()) {
+          const userData = { id: userDoc.id, ...userDoc.data() } as User;
+          setUser(userData);
+
+          // Fetch org doc
+          if (userData.orgId) {
+            const orgDoc = await getDoc(doc(db, 'organisations', userData.orgId));
+            if (orgDoc.exists()) {
+              setOrganisation({ id: orgDoc.id, ...orgDoc.data() } as Organisation);
+            }
+          }
+
+          // Check if lead
+          leadStatusUnsubscribe = onSnapshot(doc(db, 'users', fUser.uid), (doc) => {
+             setIsLead(doc.data()?.isLead || false);
+          });
+          
+          setLoading(false);
+        } else {
+          setUser(null);
+          setOrganisation(null);
+          setLoading(false);
+        }
+      } else {
+        setUser(null);
+        setOrganisation(null);
+        setLoading(false);
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      if (leadStatusUnsubscribe) {
+        leadStatusUnsubscribe();
+      }
+    };
+  }, []);
+
+  return (
+    <AuthContext.Provider value={{ user, organisation, firebaseUser, loading, isLead }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export const useAuth = () => useContext(AuthContext);
+
+```
+
+
+## File: src/index.css
+```
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  
+  --color-pending: #E24B4A;
+  --color-help: #378ADD;
+  --color-done: #639922;
+  --color-expired: #888780;
+  --color-rejected: #EF9F27;
+  
+  --color-lead: #8B5CF6; /* Purple for authority */
+}
+
+@layer base {
+  body {
+    @apply bg-neutral-50 text-neutral-900 font-sans antialiased;
+  }
+  
+  h1, h2, h3, h4 {
+    @apply font-semibold tracking-tight;
+  }
+}
+
+.task-card-border {
+  border-left-width: 4px;
+}
+
+.bottom-nav-blur {
+  @apply backdrop-blur-md bg-white/80 border-t border-neutral-200;
+}
+
+/* Custom scrollbar for minimal feel */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-neutral-200 rounded-full;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-neutral-300;
+}
+
+
+```
+
+
+## File: src/lib/firebase.ts
+```
+import { initializeApp } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
+import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
+import { getStorage } from 'firebase/storage';
+
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID
+};
+
+const app = initializeApp(firebaseConfig);
+export const auth = getAuth(app);
+export const db = getFirestore(app, import.meta.env.VITE_FIRESTORE_DATABASE_ID);
+export const storage = getStorage(app);
+
+async function testConnection() {
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.error("Please check your Firebase configuration.");
+    }
+  }
+}
+
+testConnection();
+
+```
+
+
+## File: src/lib/utils.ts
+```
+import { clsx, type ClassValue } from 'clsx';
+import { twMerge } from 'tailwind-merge';
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+
+```
+
+
+## File: src/main.tsx
+```
+import {StrictMode} from 'react';
+import {createRoot} from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+
+```
+
+
+## File: src/pages/admin/Departments.tsx
+```
+import React, { useEffect, useState } from 'react';
+import { collection, query, where, getDocs, doc, setDoc, serverTimestamp } from 'firebase/firestore';
+import { db } from '../../lib/firebase';
+import { useAuth } from '../../contexts/AuthContext';
+import { Department, User } from '../../types';
+import { Plus, Network, User as UserIcon } from 'lucide-react';
+
+export default function Departments() {
+  const { organisation, user: currentUser } = useAuth();
+  const [departments, setDepartments] = useState<Department[]>([]);
+  const [members, setMembers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const loadData = async () => {
+    if (!organisation) return;
+    const dq = query(collection(db, 'departments'), where('orgId', '==', organisation.id));
+    const uq = query(collection(db, 'users'), where('orgId', '==', organisation.id));
+
+    const [dSnap, uSnap] = await Promise.all([getDocs(dq), getDocs(uq)]);
+    setDepartments(dSnap.docs.map(d => ({ id: d.id, ...d.data() } as Department)));
+    setMembers(uSnap.docs.map(d => ({ id: d.id, ...d.data() } as User)));
+  };
+
+  useEffect(() => {
+    loadData();
+  }, [organisation]);
+
+  const addDepartment = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!organisation) return;
+    setLoading(true);
+
+    const formData = new FormData(e.currentTarget);
+    const name = formData.get('name') as string;
+    const parentId = formData.get('parentId') as string;
+    const leadId = formData.get('leadId') as string;
+
+    try {
+      const deptId = crypto.randomUUID();
+      await setDoc(doc(db, 'departments', deptId), {
+        name,
+        orgId: organisation.id,
+        parentId: parentId || null,
+        leadId: leadId || null,
+        createdAt: serverTimestamp(),
+      });
+      e.currentTarget.reset();
+      loadData(); // Refetch to show the new department
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="space-y-8">
+      <div>
+        <h2 className="text-2xl font-bold text-neutral-900">Departments</h2>
+        <p className="text-neutral-500">Build your organisation tree.</p>
+      </div>
+
+      <form onSubmit={addDepartment} className="bg-neutral-50 p-6 rounded-2xl border border-neutral-100 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="space-y-2 col-span-1 md:col-span-2">
+          <label className="text-xs font-bold text-neutral-400 uppercase">Dept Name</label>
+          <input name="name" required className="w-full bg-white border border-neutral-200 rounded-xl px-4 py-2 outline-none focus:ring-2 focus:ring-neutral-200" />
+        </div>
+        <div className="space-y-2">
+          <label className="text-xs font-bold text-neutral-400 uppercase">Parent Dept</label>
+          <select name="parentId" className="w-full bg-white border border-neutral-200 rounded-xl px-4 py-2 outline-none focus:ring-2 focus:ring-neutral-200">
+            <option value="">None (Root Level)</option>
+            {departments.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+          </select>
+        </div>
+        <div className="space-y-2">
+          <label className="text-xs font-bold text-neutral-400 uppercase">Dept Lead</label>
+          <select name="leadId" className="w-full bg-white border border-neutral-200 rounded-xl px-4 py-2 outline-none focus:ring-2 focus:ring-neutral-200">
+            <option value="">Unassigned</option>
+            {members.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+          </select>
+        </div>
+        <button type="submit" disabled={loading} className="col-span-1 md:col-span-2 bg-neutral-900 text-white py-3 rounded-xl font-semibold hover:bg-neutral-800 transition-all flex items-center justify-center disabled:opacity-50 mt-2">
+          <Plus className="h-4 w-4 mr-2" />
+          Create Department
+        </button>
+      </form>
+
+      <div className="space-y-4">
+        {departments.map(dept => (
+          <div key={dept.id} className="bg-white border border-neutral-100 p-5 rounded-2xl flex items-center justify-between group hover:border-neutral-200 transition-all">
+            <div className="flex items-center space-x-4">
+              <div className="h-10 w-10 bg-neutral-50 rounded-xl flex items-center justify-center text-neutral-400">
+                <Network className="h-5 w-5" />
+              </div>
+              <div>
+                <h4 className="font-semibold">{dept.name}</h4>
+                <div className="flex items-center text-xs text-neutral-400 mt-0.5">
+                  <UserIcon className="h-3 w-3 mr-1" />
+                  {members.find(m => m.id === dept.leadId)?.name || 'No Lead'}
+                  {dept.parentId && ` • Child of ${departments.find(d => d.id === dept.parentId)?.name}`}
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/admin/Members.tsx
+```
+import { useEffect, useState } from 'react';
+import { collection, query, where, getDocs } from 'firebase/firestore';
+import { db } from '../../lib/firebase';
+import { useAuth } from '../../contexts/AuthContext';
+import { User, Role } from '../../types';
+import { User as UserIcon, Mail, Shield } from 'lucide-react';
+
+export default function Members() {
+  const { organisation } = useAuth();
+  const [members, setMembers] = useState<User[]>([]);
+  const [roles, setRoles] = useState<Role[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const loadData = async () => {
+    if (!organisation) return;
+    const uq = query(collection(db, 'users'), where('orgId', '==', organisation.id));
+    const rq = query(collection(db, 'roles'), where('orgId', '==', organisation.id));
+
+    const [uSnap, rSnap] = await Promise.all([getDocs(uq), getDocs(rq)]);
+    setMembers(uSnap.docs.map(d => ({ id: d.id, ...d.data() } as User)));
+    setRoles(rSnap.docs.map(d => ({ id: d.id, ...d.data() } as Role)));
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    loadData();
+  }, [organisation]);
+
+  return (
+    <div className="space-y-8">
+      <div>
+        <h2 className="text-2xl font-bold text-neutral-900">Members</h2>
+        <p className="text-neutral-500">View and manage all people in your organisation.</p>
+      </div>
+
+      <div className="overflow-hidden border border-neutral-100 rounded-2xl">
+        <table className="w-full text-left">
+          <thead className="bg-neutral-50 border-b border-neutral-100">
+            <tr>
+              <th className="px-6 py-4 text-xs font-bold text-neutral-400 uppercase tracking-wider">User</th>
+              <th className="px-6 py-4 text-xs font-bold text-neutral-400 uppercase tracking-wider">Roles</th>
+              <th className="px-6 py-4 text-xs font-bold text-neutral-400 uppercase tracking-wider">Joined</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-neutral-50">
+            {members.map((member) => (
+              <tr key={member.id} className="hover:bg-neutral-25 transition-colors">
+                <td className="px-6 py-4">
+                  <div className="flex items-center space-x-3">
+                    <div className="h-9 w-9 bg-neutral-100 rounded-full flex items-center justify-center text-neutral-500">
+                      <UserIcon className="h-4 w-4" />
+                    </div>
+                    <div>
+                      <div className="font-semibold text-neutral-900">{member.name}</div>
+                      <div className="text-xs text-neutral-500 flex items-center">
+                        <Mail className="h-3 w-3 mr-1" />
+                        {member.email}
+                      </div>
+                    </div>
+                  </div>
+                </td>
+                <td className="px-6 py-4">
+                  <div className="flex flex-wrap gap-1">
+                    {member.roleIds?.map(roleId => (
+                      <span key={roleId} className="px-2 py-0.5 bg-neutral-100 text-neutral-600 rounded text-[10px] font-bold uppercase tracking-tight">
+                        {roles.find(r => r.id === roleId)?.name || 'Member'}
+                      </span>
+                    ))}
+                    {(!member.roleIds || member.roleIds.length === 0) && (
+                      <span className="px-2 py-0.5 bg-neutral-100 text-neutral-400 rounded text-[10px] font-bold uppercase tracking-tight">
+                        No Roles
+                      </span>
+                    )}
+                  </div>
+                </td>
+                <td className="px-6 py-4 text-sm text-neutral-500">
+                  {new Date(member.createdAt).toLocaleDateString()}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/admin/Roles.tsx
+```
+import React, { useEffect, useState } from 'react';
+import { collection, query, where, getDocs, doc, setDoc, serverTimestamp } from 'firebase/firestore';
+import { db } from '../../lib/firebase';
+import { useAuth } from '../../contexts/AuthContext';
+import { Role, Department } from '../../types';
+import { motion } from 'motion/react';
+import { Plus, Link as LinkIcon, Copy, Check } from 'lucide-react';
+
+export default function Roles() {
+  const { organisation } = useAuth();
+  const [roles, setRoles] = useState<Role[]>([]);
+  const [departments, setDepartments] = useState<Department[]>([]);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  const loadData = async () => {
+    if (!organisation) return;
+    const rq = query(collection(db, 'roles'), where('orgId', '==', organisation.id));
+    const dq = query(collection(db, 'departments'), where('orgId', '==', organisation.id));
+
+    const [rSnap, dSnap] = await Promise.all([getDocs(rq), getDocs(dq)]);
+    setRoles(rSnap.docs.map(d => ({ id: d.id, ...d.data() } as Role)));
+    setDepartments(dSnap.docs.map(d => ({ id: d.id, ...d.data() } as Department)));
+  };
+
+  useEffect(() => {
+    loadData();
+  }, [organisation]);
+
+  const generateLink = async (role: Role) => {
+    const token = crypto.randomUUID();
+    const inviteId = crypto.randomUUID();
+    await setDoc(doc(db, 'invites', inviteId), {
+      roleId: role.id,
+      orgId: role.orgId,
+      token: token,
+      used: false,
+      createdAt: serverTimestamp(),
+    });
+
+    const link = `${window.location.origin}/join/${token}`;
+    navigator.clipboard.writeText(link);
+    setCopiedId(role.id);
+    setTimeout(() => setCopiedId(null), 2000);
+  };
+
+  const createRole = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!organisation) return;
+    const formData = new FormData(e.currentTarget);
+    const name = formData.get('name') as string;
+    const deptId = formData.get('deptId') as string;
+
+    const roleId = crypto.randomUUID();
+    await setDoc(doc(db, 'roles', roleId), {
+      name,
+      deptId,
+      orgId: organisation.id,
+      createdAt: serverTimestamp(),
+    });
+    e.currentTarget.reset();
+    loadData(); // Refetch roles
+  };
+
+  return (
+    <div className="space-y-8">
+      <div>
+        <h2 className="text-2xl font-bold text-neutral-900">Roles & Access</h2>
+        <p className="text-neutral-500">Define roles and generate signup links for your team.</p>
+      </div>
+
+      <form onSubmit={createRole} className="bg-neutral-50 p-6 rounded-2xl border border-neutral-100 flex gap-4">
+        <input 
+          name="name" 
+          placeholder="Role Name (e.g. Teacher)" 
+          required 
+          className="flex-1 bg-white border border-neutral-200 rounded-xl px-4 py-2 outline-none focus:ring-2 focus:ring-neutral-200"
+        />
+        <select 
+          name="deptId" 
+          required 
+          className="bg-white border border-neutral-200 rounded-xl px-4 py-2 outline-none focus:ring-2 focus:ring-neutral-200"
+        >
+          {departments.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+        </select>
+        <button type="submit" className="bg-neutral-900 text-white px-6 py-2 rounded-xl hover:bg-neutral-800 transition-all flex items-center">
+          <Plus className="h-4 w-4 mr-2" />
+          Add Role
+        </button>
+      </form>
+
+      <div className="grid gap-4">
+        {roles.map(role => (
+          <div key={role.id} className="border border-neutral-100 p-4 rounded-2xl flex items-center justify-between">
+            <div>
+              <h4 className="font-semibold">{role.name}</h4>
+              <p className="text-xs text-neutral-400">
+                {departments.find(d => d.id === role.deptId)?.name || 'External'}
+              </p>
+            </div>
+            <button 
+              onClick={() => generateLink(role)}
+              className="p-2.5 rounded-xl border border-neutral-200 hover:bg-neutral-50 transition-all flex items-center text-sm font-medium"
+            >
+              {copiedId === role.id ? (
+                <>
+                  <Check className="h-4 w-4 mr-2 text-green-500" />
+                  Copied Link
+                </>
+              ) : (
+                <>
+                  <LinkIcon className="h-4 w-4 mr-2 text-neutral-400" />
+                  Invite Link
+                </>
+              )}
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/admin/Tasks.tsx
+```
+import React, { useEffect, useState } from 'react';
+import { collection, query, where, getDocs, doc, setDoc, serverTimestamp } from 'firebase/firestore';
+import { db } from '../../lib/firebase';
+import { useAuth } from '../../contexts/AuthContext';
+import { Role, User, TaskState, Department } from '../../types';
+import { Plus, ClipboardList } from 'lucide-react';
+
+export default function AdminTasks() {
+  const { user, organisation } = useAuth();
+  const [members, setMembers] = useState<User[]>([]);
+  const [departments, setDepartments] = useState<Department[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const loadData = async () => {
+      if (!organisation) return;
+      const uq = query(collection(db, 'users'), where('orgId', '==', organisation.id));
+      const dq = query(collection(db, 'departments'), where('orgId', '==', organisation.id));
+      
+      const [uSnap, dSnap] = await Promise.all([getDocs(uq), getDocs(dq)]);
+      setMembers(uSnap.docs.map(d => ({ id: d.id, ...d.data() } as User)));
+      setDepartments(dSnap.docs.map(d => ({ id: d.id, ...d.data() } as Department)));
+    };
+    loadData();
+  }, [organisation]);
+
+  const createTask = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!user || !organisation) return;
+    setLoading(true);
+
+    const formData = new FormData(e.currentTarget);
+    const title = formData.get('title') as string;
+    const description = formData.get('description') as string;
+    const assignedTo = formData.get('assignedTo') as string;
+    const deptId = formData.get('deptId') as string;
+    const deadline = formData.get('deadline') as string;
+
+    try {
+      const taskId = crypto.randomUUID();
+      await setDoc(doc(db, 'tasks', taskId), {
+        title,
+        description,
+        assignedBy: user.id,
+        assignedTo,
+        deptId,
+        orgId: organisation.id,
+        deadline: deadline ? new Date(deadline).getTime() : null,
+        state: TaskState.PENDING,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      e.currentTarget.reset();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="space-y-8">
+      <div>
+        <h2 className="text-2xl font-bold text-neutral-900">Assign Tasks</h2>
+        <p className="text-neutral-500">Create work for your team members.</p>
+      </div>
+
+      <form onSubmit={createTask} className="space-y-4 max-w-lg bg-neutral-50 p-6 rounded-2xl border border-neutral-100">
+        <div className="space-y-2">
+          <label className="text-xs font-bold text-neutral-400 uppercase tracking-wider">Task Title</label>
+          <input 
+            name="title" 
+            required 
+            placeholder="e.g. Prepare Quarter Report" 
+            className="w-full bg-white border border-neutral-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-neutral-200 transition-all font-medium"
+          />
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-xs font-bold text-neutral-400 uppercase tracking-wider">Description</label>
+          <textarea 
+            name="description" 
+            rows={3}
+            placeholder="Explain what needs to be done..." 
+            className="w-full bg-white border border-neutral-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-neutral-200 transition-all text-sm h-32 resize-none"
+          />
+        </div>
+
+        <div className="grid grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <label className="text-xs font-bold text-neutral-400 uppercase tracking-wider">Assign To</label>
+            <select name="assignedTo" required className="w-full bg-white border border-neutral-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-neutral-200 transition-all">
+              {members.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+          </div>
+          <div className="space-y-2">
+            <label className="text-xs font-bold text-neutral-400 uppercase tracking-wider">Department</label>
+            <select name="deptId" required className="w-full bg-white border border-neutral-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-neutral-200 transition-all">
+              {departments.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-xs font-bold text-neutral-400 uppercase tracking-wider">Deadline (Optional)</label>
+          <input 
+            name="deadline" 
+            type="datetime-local" 
+            className="w-full bg-white border border-neutral-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-neutral-200 transition-all"
+          />
+        </div>
+
+        <button 
+          disabled={loading}
+          type="submit" 
+          className="w-full bg-neutral-900 text-white py-3 rounded-xl font-semibold hover:bg-neutral-800 transition-all flex items-center justify-center disabled:opacity-50"
+        >
+          {loading ? 'Creating...' : (
+            <>
+              <Plus className="h-4 w-4 mr-2" />
+              Create Task
+            </>
+          )}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/Admin.tsx
+```
+import React from 'react';
+import { Routes, Route, Link, useLocation } from 'react-router-dom';
+import Departments from './admin/Departments';
+import Roles from './admin/Roles';
+import AdminTasks from './admin/Tasks';
+import Members from './admin/Members';
+import { cn } from '../lib/utils';
+import { Network, Tag, ClipboardList, Users, ArrowLeft } from 'lucide-react';
+
+export default function Admin() {
+  const location = useLocation();
+
+  const navItems = [
+    { label: 'Departments', path: '/admin/departments', icon: Network },
+    { label: 'Roles', path: '/admin/roles', icon: Tag },
+    { label: 'Tasks', path: '/admin/tasks', icon: ClipboardList },
+    { label: 'Members', path: '/admin/members', icon: Users },
+  ];
+
+  return (
+    <div className="min-h-screen bg-white">
+      <header className="h-16 border-b border-neutral-100 flex items-center px-4 justify-between sticky top-0 bg-white z-40">
+        <div className="flex items-center space-x-4">
+          <Link to="/dashboard" className="p-2 hover:bg-neutral-50 rounded-lg">
+            <ArrowLeft className="h-5 w-5 text-neutral-500" />
+          </Link>
+          <h1 className="text-xl font-bold tracking-tight">Admin Section</h1>
+        </div>
+      </header>
+
+      <div className="max-w-4xl mx-auto flex">
+        <aside className="w-64 border-r border-neutral-100 h-[calc(100vh-64px)] p-4 space-y-2 hidden md:block">
+          {navItems.map((item) => (
+            <Link
+              key={item.path}
+              to={item.path}
+              className={cn(
+                "flex items-center space-x-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
+                location.pathname.startsWith(item.path)
+                  ? "bg-neutral-100 text-neutral-900"
+                  : "text-neutral-500 hover:bg-neutral-50 hover:text-neutral-900"
+              )}
+            >
+              <item.icon className="h-4 w-4" />
+              <span>{item.label}</span>
+            </Link>
+          ))}
+        </aside>
+
+        <main className="flex-1 p-8">
+          <Routes>
+            <Route path="departments" element={<Departments />} />
+            <Route path="roles" element={<Roles />} />
+            <Route path="tasks" element={<AdminTasks />} />
+            <Route path="members" element={<Members />} />
+            <Route path="/" element={<Departments />} />
+          </Routes>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/dashboard/Chat.tsx
+```
+import React, { useEffect, useState, useRef } from 'react';
+import { collection, query, where, orderBy, limit, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
+import { db } from '../../lib/firebase';
+import { useAuth } from '../../contexts/AuthContext';
+import { Send } from 'lucide-react';
+import { motion } from 'motion/react';
+import { cn } from '../../lib/utils';
+
+interface Message {
+  id: string;
+  text: string;
+  senderId: string;
+  senderName: string;
+  orgId: string;
+  createdAt: any;
+}
+
+export default function Chat() {
+  const { user, organisation } = useAuth();
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [newMessage, setNewMessage] = useState('');
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!organisation) return;
+
+    const q = query(
+      collection(db, 'messages'),
+      where('orgId', '==', organisation.id),
+      orderBy('createdAt', 'asc'),
+      limit(100)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      setMessages(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Message)));
+      setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+    });
+
+    return () => unsubscribe();
+  }, [organisation]);
+
+  const sendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newMessage.trim() || !user || !organisation) return;
+
+    const text = newMessage.trim();
+    setNewMessage('');
+
+    try {
+      await addDoc(collection(db, 'messages'), {
+        text,
+        senderId: user.id,
+        senderName: user.name,
+        orgId: organisation.id,
+        createdAt: serverTimestamp()
+      });
+    } catch (err) {
+      console.error("Error sending message:", err);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-140px)]">
+      <div className="mb-4">
+        <h1 className="text-2xl font-bold text-neutral-900">Org Chat</h1>
+        <p className="text-sm text-neutral-500">Global communication</p>
+      </div>
+
+      <div className="flex-1 bg-white border border-neutral-200 rounded-2xl overflow-hidden flex flex-col">
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {messages.length === 0 ? (
+            <div className="h-full flex items-center justify-center text-neutral-400 text-sm">
+              No messages yet. Start the conversation!
+            </div>
+          ) : (
+            messages.map((msg) => {
+              const isMe = msg.senderId === user?.id;
+              return (
+                <motion.div 
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  key={msg.id} 
+                  className={cn("flex flex-col", isMe ? "items-end" : "items-start")}
+                >
+                  <span className="text-[10px] text-neutral-400 font-medium mb-1 px-1">
+                    {isMe ? 'You' : msg.senderName}
+                  </span>
+                  <div 
+                    className={cn(
+                      "px-4 py-2 rounded-2xl max-w-[80%] text-sm",
+                      isMe 
+                        ? "bg-neutral-900 text-white rounded-tr-sm" 
+                        : "bg-neutral-100 text-neutral-900 rounded-tl-sm"
+                    )}
+                  >
+                    {msg.text}
+                  </div>
+                </motion.div>
+              );
+            })
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+
+        <form onSubmit={sendMessage} className="p-3 bg-neutral-50 border-t border-neutral-100 flex gap-2">
+          <input
+            type="text"
+            value={newMessage}
+            onChange={(e) => setNewMessage(e.target.value)}
+            placeholder="Type a message..."
+            className="flex-1 bg-white border border-neutral-200 rounded-xl px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+          />
+          <button 
+            type="submit" 
+            disabled={!newMessage.trim()}
+            className="bg-neutral-900 text-white h-10 w-10 rounded-xl flex items-center justify-center disabled:opacity-50 hover:bg-neutral-800 transition-colors"
+          >
+            <Send className="h-4 w-4" />
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/dashboard/FileVault.tsx
+```
+import React, { useEffect, useState } from 'react';
+import { collection, query, where, getDocs, addDoc, serverTimestamp, orderBy } from 'firebase/firestore';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { db, storage } from '../../lib/firebase';
+import { useAuth } from '../../contexts/AuthContext';
+import { FileUp, File, Download, Loader2 } from 'lucide-react';
+
+interface FileRecord {
+  id: string;
+  name: string;
+  url: string;
+  size: number;
+  uploadedBy: string;
+  uploadedByName: string;
+  orgId: string;
+  createdAt: any;
+}
+
+export default function FileVault() {
+  const { user, organisation } = useAuth();
+  const [files, setFiles] = useState<FileRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+
+  const loadFiles = async () => {
+    if (!organisation) return;
+    setLoading(true);
+    try {
+      const q = query(
+        collection(db, 'files'),
+        where('orgId', '==', organisation.id),
+        orderBy('createdAt', 'desc')
+      );
+      const snap = await getDocs(q);
+      setFiles(snap.docs.map(d => ({ id: d.id, ...d.data() } as FileRecord)));
+    } catch (err) {
+      console.error("Error loading files:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadFiles();
+  }, [organisation]);
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !user || !organisation) return;
+
+    setUploading(true);
+    try {
+      // Create a unique path in storage
+      const fileRef = ref(storage, `orgs/${organisation.id}/${crypto.randomUUID()}_${file.name}`);
+      
+      // Upload to Firebase Storage
+      await uploadBytes(fileRef, file);
+      
+      // Get the download URL
+      const url = await getDownloadURL(fileRef);
+
+      // Save metadata to Firestore
+      await addDoc(collection(db, 'files'), {
+        name: file.name,
+        url,
+        size: file.size,
+        uploadedBy: user.id,
+        uploadedByName: user.name,
+        orgId: organisation.id,
+        createdAt: serverTimestamp()
+      });
+
+      // Refetch files
+      await loadFiles();
+    } catch (err) {
+      console.error("Error uploading file:", err);
+      alert("Failed to upload file. Have you enabled Firebase Storage?");
+    } finally {
+      setUploading(false);
+      e.target.value = ''; // Reset input
+    }
+  };
+
+  const formatSize = (bytes: number) => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex justify-between items-end">
+        <div>
+          <h1 className="text-2xl font-bold text-neutral-900">File Vault</h1>
+          <p className="text-sm text-neutral-500">Shared organisation documents</p>
+        </div>
+        
+        <label className="bg-neutral-900 text-white px-4 py-2 rounded-xl flex items-center cursor-pointer hover:bg-neutral-800 transition-colors">
+          {uploading ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <FileUp className="h-4 w-4 mr-2" />}
+          {uploading ? 'Uploading...' : 'Upload File'}
+          <input type="file" className="hidden" onChange={handleFileUpload} disabled={uploading} />
+        </label>
+      </div>
+
+      {loading ? (
+        <div className="animate-pulse space-y-3">
+          {[1,2,3].map(i => <div key={i} className="h-16 bg-neutral-100 rounded-2xl" />)}
+        </div>
+      ) : files.length === 0 ? (
+        <div className="py-20 flex flex-col items-center justify-center text-neutral-300 border-2 border-dashed border-neutral-200 rounded-2xl">
+          <File className="h-12 w-12 mb-4 text-neutral-200" />
+          <p className="font-medium text-neutral-400">No files uploaded yet.</p>
+        </div>
+      ) : (
+        <div className="grid gap-3">
+          {files.map(file => (
+            <div key={file.id} className="bg-white border border-neutral-200 p-4 rounded-2xl flex items-center justify-between hover:border-neutral-300 transition-colors">
+              <div className="flex items-center space-x-4 overflow-hidden">
+                <div className="h-10 w-10 bg-neutral-50 rounded-xl flex items-center justify-center text-neutral-400 flex-shrink-0">
+                  <File className="h-5 w-5" />
+                </div>
+                <div className="min-w-0">
+                  <h4 className="font-semibold text-neutral-900 truncate">{file.name}</h4>
+                  <div className="flex items-center text-xs text-neutral-500 mt-0.5 space-x-2">
+                    <span>{formatSize(file.size)}</span>
+                    <span>•</span>
+                    <span>By {file.uploadedByName}</span>
+                  </div>
+                </div>
+              </div>
+              <a 
+                href={file.url} 
+                target="_blank" 
+                rel="noreferrer"
+                className="h-10 w-10 bg-neutral-50 rounded-xl flex items-center justify-center text-neutral-600 hover:bg-neutral-100 transition-colors flex-shrink-0"
+              >
+                <Download className="h-4 w-4" />
+              </a>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/dashboard/Notifications.tsx
+```
+import React, { useEffect, useState } from 'react';
+import { collection, query, where, getDocs, orderBy, limit } from 'firebase/firestore';
+import { db } from '../../lib/firebase';
+import { useAuth } from '../../contexts/AuthContext';
+import { Bell, AlertCircle, Info } from 'lucide-react';
+
+interface Notification {
+  id: string;
+  title: string;
+  message: string;
+  userId: string;
+  type: 'info' | 'alert' | 'task';
+  read: boolean;
+  createdAt: any;
+}
+
+export default function NotificationsPage() {
+  const { user } = useAuth();
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const loadNotifications = async () => {
+      if (!user) return;
+      
+      try {
+        const q = query(
+          collection(db, 'notifications'),
+          where('userId', '==', user.id),
+          orderBy('createdAt', 'desc'),
+          limit(50)
+        );
+        
+        const snap = await getDocs(q);
+        setNotifications(snap.docs.map(d => ({ id: d.id, ...d.data() } as Notification)));
+      } catch (err) {
+        console.error("Error loading notifications:", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadNotifications();
+  }, [user]);
+
+  const getIcon = (type: string) => {
+    switch (type) {
+      case 'alert': return <AlertCircle className="h-5 w-5 text-red-500" />;
+      case 'task': return <Bell className="h-5 w-5 text-blue-500" />;
+      default: return <Info className="h-5 w-5 text-neutral-500" />;
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="mb-4">
+        <h1 className="text-2xl font-bold text-neutral-900">Notifications</h1>
+        <p className="text-sm text-neutral-500">Updates and alerts for you</p>
+      </div>
+
+      {loading ? (
+        <div className="animate-pulse space-y-3">
+          {[1,2,3].map(i => <div key={i} className="h-20 bg-neutral-100 rounded-2xl" />)}
+        </div>
+      ) : notifications.length === 0 ? (
+        <div className="py-20 flex flex-col items-center justify-center text-neutral-300">
+          <Bell className="h-12 w-12 mb-4 text-neutral-200" />
+          <p className="font-medium text-neutral-400">You're all caught up!</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {notifications.map(notif => (
+            <div 
+              key={notif.id} 
+              className={`p-4 rounded-2xl border ${notif.read ? 'bg-white border-neutral-100' : 'bg-blue-50/50 border-blue-100'} flex items-start space-x-4`}
+            >
+              <div className="mt-1">
+                {getIcon(notif.type)}
+              </div>
+              <div>
+                <h4 className={`font-semibold ${notif.read ? 'text-neutral-900' : 'text-blue-900'}`}>
+                  {notif.title}
+                </h4>
+                <p className={`text-sm mt-1 ${notif.read ? 'text-neutral-500' : 'text-blue-800/80'}`}>
+                  {notif.message}
+                </p>
+                <div className="text-xs text-neutral-400 mt-2 font-medium uppercase tracking-wider">
+                  {notif.createdAt ? new Date(notif.createdAt.toMillis()).toLocaleString() : 'Just now'}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/dashboard/Staff.tsx
+```
+import { useEffect, useState } from 'react';
+import { collection, query, where, onSnapshot, getDocs } from 'firebase/firestore';
+import { db } from '../../lib/firebase';
+import { useAuth } from '../../contexts/AuthContext';
+import { User, Task, TaskState } from '../../types';
+import { motion, AnimatePresence } from 'motion/react';
+import { User as UserIcon, Plus, ChevronRight } from 'lucide-react';
+import { cn } from '../../lib/utils';
+
+export default function Staff() {
+  const { user, organisation } = useAuth();
+  const [reports, setReports] = useState<User[]>([]);
+  const [tasks, setTasks] = useState<Record<string, Task[]>>({});
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const loadData = async () => {
+      if (!user || !organisation) return;
+      setLoading(true);
+
+      const q = query(
+        collection(db, 'users'),
+        where('orgId', '==', organisation.id)
+      );
+
+      try {
+        const snapshot = await getDocs(q);
+        const userList = snapshot.docs
+          .map(doc => ({ id: doc.id, ...doc.data() } as User))
+          .filter(u => u.id !== user.id);
+        
+        setReports(userList);
+        
+        // Fetch tasks for all these users concurrently
+        const taskPromises = userList.map(async (report) => {
+          const tq = query(collection(db, 'tasks'), where('assignedTo', '==', report.id));
+          const tsnap = await getDocs(tq);
+          return {
+            reportId: report.id,
+            tasks: tsnap.docs.map(d => ({ id: d.id, ...d.data() } as Task))
+          };
+        });
+
+        const taskResults = await Promise.all(taskPromises);
+        const tasksMap: Record<string, Task[]> = {};
+        taskResults.forEach(res => {
+          tasksMap[res.reportId] = res.tasks;
+        });
+        
+        setTasks(tasksMap);
+      } catch (err) {
+        console.error("Error loading staff data:", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadData();
+  }, [user, organisation]);
+
+  if (loading) return <div className="animate-pulse space-y-4 pt-10"><div className="h-4 bg-neutral-200 w-1/4 rounded"></div><div className="h-20 bg-neutral-100 rounded-2xl"></div></div>;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-neutral-900">Staff List</h1>
+        <p className="text-sm text-neutral-500">Managing {reports.length} members</p>
+      </div>
+
+      <div className="space-y-3">
+        {reports.map((report) => {
+          const userTasks = tasks[report.id] || [];
+          return (
+            <div 
+              key={report.id}
+              className="bg-white border border-neutral-200 rounded-2xl p-4 flex items-center justify-between hover:bg-neutral-50 transition-all cursor-pointer group"
+            >
+              <div className="flex items-center space-x-4">
+                <div className="h-10 w-10 bg-neutral-100 rounded-full flex items-center justify-center text-neutral-500">
+                  <UserIcon className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="font-semibold text-neutral-900">{report.name}</h3>
+                  <div className="flex items-center mt-1 space-x-1">
+                    {userTasks.length === 0 ? (
+                      <span className="text-[10px] text-neutral-400 font-mono uppercase tracking-widest">No Active Tasks</span>
+                    ) : (
+                      userTasks.map((t, idx) => (
+                        <div 
+                          key={t.id} 
+                          className={cn(
+                            "h-2 w-2 rounded-full",
+                            t.state === TaskState.PENDING && "bg-pending",
+                            t.state === TaskState.HELP_NEEDED && "bg-help",
+                            t.state === TaskState.DONE && "bg-done",
+                            t.state === TaskState.EXPIRED && "bg-expired",
+                            t.state === TaskState.REJECTED && "bg-rejected"
+                          )} 
+                        />
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+              
+              <ChevronRight className="h-5 w-5 text-neutral-300 group-hover:text-neutral-900 transition-colors" />
+            </div>
+          );
+        })}
+      </div>
+      
+      {/* Floating Action Button for Leads */}
+      <button className="fixed bottom-24 right-4 h-14 w-14 bg-neutral-900 text-white rounded-full shadow-lg flex items-center justify-center hover:scale-105 active:scale-95 transition-all">
+        <Plus className="h-6 w-6" />
+      </button>
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/dashboard/Tasks.tsx
+```
+import { useEffect, useState } from 'react';
+import { collection, query, where, onSnapshot, orderBy, limit } from 'firebase/firestore';
+import { db } from '../../lib/firebase';
+import { useAuth } from '../../contexts/AuthContext';
+import { Task } from '../../types';
+import TaskCard from '../../components/tasks/TaskCard';
+import { motion } from 'motion/react';
+import { Inbox } from 'lucide-react';
+
+export default function Tasks() {
+  const { user } = useAuth();
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!user) return;
+
+    // Fetch tasks assigned to the user
+    // Limit to 50 to prevent massive reads
+    const q = query(
+      collection(db, 'tasks'),
+      where('assignedTo', '==', user.id),
+      orderBy('createdAt', 'desc'),
+      limit(50)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const taskList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Task));
+      setTasks(taskList);
+      setLoading(false);
+    }, (error) => {
+      console.error("Firestore Error in Tasks:", error);
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  if (loading) {
+    return (
+      <div className="space-y-4">
+        {[1, 2, 3].map(i => (
+          <div key={i} className="h-24 bg-neutral-100 rounded-2xl animate-pulse" />
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex justify-between items-end">
+        <div>
+          <h1 className="text-2xl font-bold text-neutral-900">Your Tasks</h1>
+          <p className="text-sm text-neutral-500">{tasks.length} items to act on</p>
+        </div>
+      </div>
+
+      {tasks.length === 0 ? (
+        <div className="py-20 flex flex-col items-center justify-center text-neutral-300">
+          <Inbox className="h-12 w-12 mb-4" />
+          <p className="font-medium">No tasks yet</p>
+        </div>
+      ) : (
+        <motion.div 
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          className="space-y-2"
+        >
+          {tasks.map(task => (
+            <TaskCard key={task.id} task={task} />
+          ))}
+        </motion.div>
+      )}
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/Dashboard.tsx
+```
+import { Routes, Route, Navigate } from 'react-router-dom';
+import BottomNav from '../components/layout/BottomNav';
+import Tasks from './dashboard/Tasks';
+import Staff from './dashboard/Staff';
+import Chat from './dashboard/Chat';
+import FileVault from './dashboard/FileVault';
+import NotificationsPage from './dashboard/Notifications';
+import { useAuth } from '../contexts/AuthContext';
+
+export default function Dashboard() {
+  const { isLead } = useAuth();
+
+  return (
+    <div className="min-h-screen bg-neutral-50 pb-20">
+      <main className="max-w-2xl mx-auto px-4 pt-8">
+        <Routes>
+          <Route path="tasks" element={<Tasks />} />
+          {isLead && <Route path="staff" element={<Staff />} />}
+          <Route path="chat" element={<Chat />} />
+          <Route path="files" element={<FileVault />} />
+          <Route path="notifications" element={<NotificationsPage />} />
+          <Route path="/" element={<Navigate to="tasks" replace />} />
+        </Routes>
+      </main>
+      <BottomNav />
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/JoinLink.tsx
+```
+import React, { useEffect, useState } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { collection, query, where, getDocs, doc, setDoc, updateDoc, serverTimestamp } from 'firebase/firestore';
+import { createUserWithEmailAndPassword } from 'firebase/auth';
+import { db, auth } from '../lib/firebase';
+import { motion } from 'motion/react';
+import { User, Mail, Lock, ArrowRight, Loader2 } from 'lucide-react';
+import { Invite, Role } from '../types';
+
+export default function JoinLink() {
+  const { token } = useParams();
+  const [invite, setInvite] = useState<Invite | null>(null);
+  const [role, setRole] = useState<Role | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [registering, setRegistering] = useState(false);
+  const [error, setError] = useState('');
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    const checkToken = async () => {
+      if (!token) return;
+      const q = query(collection(db, 'invites'), where('token', '==', token), where('used', '==', false));
+      const snapshot = await getDocs(q);
+      
+      if (snapshot.empty) {
+        setError('This link is invalid or has already been used.');
+        setLoading(false);
+        return;
+      }
+
+      const inviteData = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() } as Invite;
+      setInvite(inviteData);
+
+      const roleDoc = await getDocs(query(collection(db, 'roles'), where('id', '==', inviteData.roleId)));
+      // Wait, I should use doc get if I have ID. I'll just find it.
+      const rolesSnapshot = await getDocs(query(collection(db, 'roles')));
+      const foundRole = rolesSnapshot.docs.find(d => d.id === inviteData.roleId);
+      if (foundRole) {
+        setRole({ id: foundRole.id, ...foundRole.data() } as Role);
+      }
+
+      setLoading(false);
+    };
+
+    checkToken();
+  }, [token]);
+
+  const handleJoin = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!invite || !role) return;
+    setRegistering(true);
+    setError('');
+
+    const formData = new FormData(e.currentTarget);
+    const name = formData.get('name') as string;
+    const email = formData.get('email') as string;
+    const password = formData.get('password') as string;
+
+    try {
+      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+      const user = userCredential.user;
+
+      // Create User Doc
+      await setDoc(doc(db, 'users', user.uid), {
+        name,
+        email,
+        orgId: invite.orgId,
+        roleIds: [invite.roleId],
+        isLead: false,
+        createdAt: serverTimestamp(),
+      });
+
+      // Mark invite as used
+      await updateDoc(doc(db, 'invites', invite.id), {
+        used: true,
+        usedBy: user.uid,
+        updatedAt: serverTimestamp(),
+      });
+
+      navigate('/dashboard');
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setRegistering(false);
+    }
+  };
+
+  if (loading) return <div className="min-h-screen flex items-center justify-center"><Loader2 className="animate-spin h-8 w-8 text-neutral-300" /></div>;
+
+  if (error) return (
+    <div className="min-h-screen flex items-center justify-center px-4">
+      <div className="max-w-md w-full text-center space-y-4">
+        <h2 className="text-2xl font-bold text-neutral-900">Link Invalid</h2>
+        <p className="text-neutral-500">{error}</p>
+        <button onClick={() => navigate('/login')} className="text-neutral-900 font-semibold underline">Go to Login</button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-neutral-50 px-4">
+      <motion.div 
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="max-w-md w-full space-y-8 bg-white p-8 rounded-2xl border border-neutral-200"
+      >
+        <div className="text-center">
+          <div className="inline-flex items-center justify-center px-3 py-1 rounded-full bg-purple-50 text-purple-600 text-xs font-bold uppercase tracking-wider mb-4">
+            Invitation to {role?.name}
+          </div>
+          <h2 className="text-3xl font-bold text-neutral-900 tracking-tight">Join the Team</h2>
+          <p className="mt-2 text-neutral-500">Create your account to accept the role</p>
+        </div>
+
+        <form className="mt-8 space-y-6" onSubmit={handleJoin}>
+          <div className="space-y-4">
+            <div className="relative">
+              <User className="absolute left-3 top-3 h-5 w-5 text-neutral-400" />
+              <input
+                name="name"
+                type="text"
+                required
+                className="block w-full pl-10 pr-3 py-2.5 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-200 focus:border-neutral-400 outline-none transition-all"
+                placeholder="Your Full Name"
+              />
+            </div>
+            <div className="relative">
+              <Mail className="absolute left-3 top-3 h-5 w-5 text-neutral-400" />
+              <input
+                name="email"
+                type="email"
+                required
+                className="block w-full pl-10 pr-3 py-2.5 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-200 focus:border-neutral-400 outline-none transition-all"
+                placeholder="Email Address"
+              />
+            </div>
+            <div className="relative">
+              <Lock className="absolute left-3 top-3 h-5 w-5 text-neutral-400" />
+              <input
+                name="password"
+                type="password"
+                required
+                className="block w-full pl-10 pr-3 py-2.5 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-200 focus:border-neutral-400 outline-none transition-all"
+                placeholder="Create Password"
+              />
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={registering}
+            className="group relative w-full flex justify-center py-3 px-4 border border-transparent text-sm font-semibold rounded-xl text-white bg-neutral-900 hover:bg-neutral-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-neutral-900 transition-all disabled:opacity-50"
+          >
+            {registering ? 'Joining...' : 'Join OrgFlow'}
+            <ArrowRight className="ml-2 h-4 w-4" />
+          </button>
+        </form>
+      </motion.div>
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/Login.tsx
+```
+import React, { useState } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
+import { signInWithEmailAndPassword } from 'firebase/auth';
+import { auth } from '../lib/firebase';
+import { motion } from 'motion/react';
+import { Mail, Lock, ArrowRight } from 'lucide-react';
+
+export default function Login() {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const navigate = useNavigate();
+
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    const formData = new FormData(e.currentTarget);
+    const email = formData.get('email') as string;
+    const password = formData.get('password') as string;
+
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+      navigate('/dashboard');
+    } catch (err: any) {
+      setError('Invalid email or password');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-neutral-50 px-4">
+      <motion.div 
+        initial={{ opacity: 0, scale: 0.95 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className="max-w-md w-full space-y-8 bg-white p-8 rounded-2xl border border-neutral-200"
+      >
+        <div className="text-center">
+          <h2 className="text-3xl font-bold text-neutral-900 tracking-tight">Welcome to OrgFlow</h2>
+          <p className="mt-2 text-neutral-500">Sign in to your account</p>
+        </div>
+
+        {error && (
+          <div className="p-3 bg-red-50 text-red-600 text-sm rounded-lg border border-red-100">
+            {error}
+          </div>
+        )}
+
+        <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
+          <div className="space-y-4">
+            <div className="relative">
+              <Mail className="absolute left-3 top-3 h-5 w-5 text-neutral-400" />
+              <input
+                name="email"
+                type="email"
+                required
+                className="block w-full pl-10 pr-3 py-2.5 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-200 focus:border-neutral-400 outline-none transition-all"
+                placeholder="Email Address"
+              />
+            </div>
+            <div className="relative">
+              <Lock className="absolute left-3 top-3 h-5 w-5 text-neutral-400" />
+              <input
+                name="password"
+                type="password"
+                required
+                className="block w-full pl-10 pr-3 py-2.5 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-200 focus:border-neutral-400 outline-none transition-all"
+                placeholder="Password"
+              />
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="group relative w-full flex justify-center py-3 px-4 border border-transparent text-sm font-semibold rounded-xl text-white bg-neutral-900 hover:bg-neutral-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-neutral-900 transition-all disabled:opacity-50"
+          >
+            {loading ? 'Logging in...' : 'Sign in'}
+            <ArrowRight className="ml-2 h-4 w-4" />
+          </button>
+        </form>
+
+        <div className="flex flex-col space-y-2 text-center text-sm">
+          <Link to="/register/org" className="text-neutral-500 hover:text-neutral-900">
+            Create an organisation
+          </Link>
+          <span className="text-neutral-300">or</span>
+          <p className="text-neutral-400">Join via a manager's link</p>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
+```
+
+
+## File: src/pages/RegisterOrg.tsx
+```
+import React, { useState } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
+import { createUserWithEmailAndPassword, updateProfile } from 'firebase/auth';
+import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
+import { auth, db } from '../lib/firebase';
+import { motion } from 'motion/react';
+import { Building2, User, Mail, Lock, ArrowRight } from 'lucide-react';
+
+export default function RegisterOrg() {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const navigate = useNavigate();
+
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    const formData = new FormData(e.currentTarget);
+    const orgName = formData.get('orgName') as string;
+    const ownerName = formData.get('ownerName') as string;
+    const email = formData.get('email') as string;
+    const password = formData.get('password') as string;
+
+    try {
+      // 1. Create User
+      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+      const user = userCredential.user;
+
+      await updateProfile(user, { displayName: ownerName });
+
+      // 2. Create Organisation
+      const orgRef = doc(db, 'organisations', crypto.randomUUID());
+      await setDoc(orgRef, {
+        name: orgName,
+        ownerId: user.uid,
+        createdAt: serverTimestamp(),
+      });
+
+      // 3. Create Root Department
+      const deptRef = doc(db, 'departments', crypto.randomUUID());
+      await setDoc(deptRef, {
+        name: orgName + ' (Root)',
+        orgId: orgRef.id,
+        parentId: null,
+        leadId: user.uid,
+        createdAt: serverTimestamp(),
+      });
+
+      // 4. Create User Doc
+      await setDoc(doc(db, 'users', user.uid), {
+        name: ownerName,
+        email: email,
+        orgId: orgRef.id,
+        roleIds: [], // Root owner has special status
+        isLead: true,
+        createdAt: serverTimestamp(),
+      });
+
+      navigate('/admin');
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-neutral-50 px-4">
+      <motion.div 
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="max-w-md w-full space-y-8 bg-white p-8 rounded-2xl border border-neutral-200"
+      >
+        <div className="text-center">
+          <h2 className="text-3xl font-bold text-neutral-900 tracking-tight">Create your Organisation</h2>
+          <p className="mt-2 text-neutral-500">Start with ORGFlow today</p>
+        </div>
+
+        {error && (
+          <div className="p-3 bg-red-50 text-red-600 text-sm rounded-lg border border-red-100">
+            {error}
+          </div>
+        )}
+
+        <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
+          <div className="space-y-4">
+            <div className="relative">
+              <Building2 className="absolute left-3 top-3 h-5 w-5 text-neutral-400" />
+              <input
+                name="orgName"
+                type="text"
+                required
+                className="block w-full pl-10 pr-3 py-2.5 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-200 focus:border-neutral-400 outline-none transition-all"
+                placeholder="Organisation Name"
+              />
+            </div>
+            <div className="relative">
+              <User className="absolute left-3 top-3 h-5 w-5 text-neutral-400" />
+              <input
+                name="ownerName"
+                type="text"
+                required
+                className="block w-full pl-10 pr-3 py-2.5 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-200 focus:border-neutral-400 outline-none transition-all"
+                placeholder="Full Name"
+              />
+            </div>
+            <div className="relative">
+              <Mail className="absolute left-3 top-3 h-5 w-5 text-neutral-400" />
+              <input
+                name="email"
+                type="email"
+                required
+                className="block w-full pl-10 pr-3 py-2.5 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-200 focus:border-neutral-400 outline-none transition-all"
+                placeholder="Email Address"
+              />
+            </div>
+            <div className="relative">
+              <Lock className="absolute left-3 top-3 h-5 w-5 text-neutral-400" />
+              <input
+                name="password"
+                type="password"
+                required
+                className="block w-full pl-10 pr-3 py-2.5 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-200 focus:border-neutral-400 outline-none transition-all"
+                placeholder="Password"
+              />
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="group relative w-full flex justify-center py-3 px-4 border border-transparent text-sm font-semibold rounded-xl text-white bg-neutral-900 hover:bg-neutral-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-neutral-900 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+          >
+            {loading ? 'Creating...' : 'Register Org'}
+            <ArrowRight className="ml-2 h-4 w-4" />
+          </button>
+        </form>
+
+        <div className="text-center text-sm">
+          <Link to="/login" className="text-neutral-500 hover:text-neutral-900">
+            Already have an account? Log in
+          </Link>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
+```
+
+
+## File: src/services/aiManagement.ts
+```
+import { Task } from '../types';
+
+export async function resolveManagementDecision(
+  requestType: string,
+  orgContext: any,
+  payload: any
+) {
+  try {
+    const response = await fetch('/api/management/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        request_type: requestType,
+        org_context: orgContext,
+        payload: payload
+      }),
+    });
+    return await response.json();
+  } catch (error) {
+    console.error('AI Management resolution failed:', error);
+    return { error: 'failed_to_resolve' };
+  }
+}
+
+```
+
+
+## File: src/types.ts
+```
+export enum TaskState {
+  PENDING = 'pending',
+  HELP_NEEDED = 'help_needed',
+  DONE = 'done',
+  EXPIRED = 'expired',
+  REJECTED = 'rejected',
+}
+
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  orgId: string;
+  roleIds: string[];
+  createdAt: number;
+}
+
+export interface Organisation {
+  id: string;
+  name: string;
+  ownerId: string;
+  createdAt: number;
+}
+
+export interface Department {
+  id: string;
+  name: string;
+  orgId: string;
+  parentId: string | null;
+  leadId: string | null;
+  createdAt: number;
+}
+
+export interface Role {
+  id: string;
+  name: string;
+  deptId: string;
+  orgId: string;
+  createdAt: number;
+}
+
+export interface Task {
+  id: string;
+  title: string;
+  description: string;
+  assignedBy: string;
+  assignedTo: string;
+  deptId: string;
+  orgId: string;
+  deadline?: number;
+  state: TaskState;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface Invite {
+  id: string;
+  roleId: string;
+  orgId: string;
+  token: string;
+  used: boolean;
+  usedBy?: string;
+  createdAt: number;
+}
+
+export interface Notification {
+  id: string;
+  userId: string;
+  text: string;
+  type: string;
+  metadata?: any;
+  read: boolean;
+  createdAt: number;
+}
+
+```

@@ -1,0 +1,102 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function getUserOrgId() {
+      // Returns the orgId of the currently logged in user
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.orgId;
+    }
+
+    function isOrgMember(orgId) {
+      return isSignedIn() && getUserOrgId() == orgId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Organisations
+    match /organisations/{orgId} {
+      allow get: if isSignedIn();
+      allow create: if isSignedIn() && incoming().ownerId == request.auth.uid;
+      allow update: if isOwner(existing().ownerId);
+    }
+
+    // Users
+    match /users/{userId} {
+      // Users can get their own data, or anyone can get anyone in their org
+      allow get: if isOwner(userId) || isOrgMember(existing().orgId);
+      
+      // Users can only list members of their own organisation
+      allow list: if isSignedIn() && resource.data.orgId == getUserOrgId(); 
+      
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) || (isSignedIn() && exists(/databases/$(database)/documents/organisations/$(existing().orgId)) && get(/databases/$(database)/documents/organisations/$(existing().orgId)).data.ownerId == request.auth.uid);
+    }
+
+    // Departments
+    match /departments/{deptId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create, update: if isOrgMember(incoming().orgId);
+    }
+
+    // Roles
+    match /roles/{roleId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create, update: if isOrgMember(incoming().orgId);
+    }
+
+    // Tasks
+    match /tasks/{taskId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create: if isOrgMember(incoming().orgId) && incoming().assignedBy == request.auth.uid;
+      allow update: if isOrgMember(existing().orgId) && (
+        (existing().assignedTo == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['state', 'updatedAt'])) ||
+        (existing().assignedBy == request.auth.uid)
+      );
+    }
+
+    // Chat Messages (NEW)
+    match /messages/{messageId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create: if isOrgMember(incoming().orgId) && incoming().senderId == request.auth.uid;
+    }
+
+    // File Vault (NEW)
+    match /files/{fileId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create: if isOrgMember(incoming().orgId) && incoming().uploadedBy == request.auth.uid;
+    }
+
+    // Invites
+    match /invites/{inviteId} {
+      allow get: if true; // Publicly accessible to check token
+      allow create: if isSignedIn();
+      allow update: if true; // To mark as used
+    }
+
+    // Notifications
+    match /notifications/{notifId} {
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isSignedIn();
+      allow update: if isOwner(resource.data.userId) && incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+    }
+  }
+}

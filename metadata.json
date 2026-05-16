@@ -1,0 +1,8 @@
+{
+  "name": "OrgFlow",
+  "description": "A recursive organizational productivity app focused on tasks and people. Built for schools, companies, and cooperatives.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
